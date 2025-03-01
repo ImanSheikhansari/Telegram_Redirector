@@ -3,8 +3,6 @@ import re
 import asyncio
 import logging
 from threading import Thread
-from datetime import datetime
-
 from telethon import TelegramClient, events
 from deep_translator import GoogleTranslator
 from flask import Flask
@@ -13,146 +11,103 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configure minimal logging
+# Configure logging
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("LowResourceBot")
+logger = logging.getLogger("RailwayBot")
 
-class ResourceManager:
-    MAX_TASKS = 2  # Limit concurrent tasks
-    TRANSLATION_TIMEOUT = 15  # Seconds
-    URL_REGEX = re.compile(r'https?://\S+')
-    
-    @classmethod
-    def get_env(cls, name: str, default: str = "") -> str:
-        return os.getenv(name, default).strip()
+class Config:
+    API_ID = int(os.getenv("API_ID", 27005697))
+    API_HASH = os.getenv("API_HASH", "a139f9146e1ee53af2309a5b000ec053")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "7820965716:AAEjPRHFA74dqhS8ZgmG7IQKpWbaHnFVaEU")
+    TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@whaleguardian")
+    SOURCE_CHANNELS = list(filter(None, os.getenv("SOURCE_CHANNELS", "cryptoquant_alert,whale_alert_io,glassnode,cryptoquant_official,AI_Iman").split(",")))
 
-class TelegramConfig:
-    API_ID = int(ResourceManager.get_env("API_ID", "0"))
-    API_HASH = ResourceManager.get_env("API_HASH")
-    PHONE = ResourceManager.get_env("PHONE")
-    SOURCE_CHATS = list(filter(None, ResourceManager.get_env("SOURCE_CHANNELS").split(",")))
-    TARGET_CHAT = ResourceManager.get_env("TARGET_CHANNEL")
-    
     @classmethod
     def validate(cls):
         required = {
             "API_ID": cls.API_ID,
             "API_HASH": cls.API_HASH,
-            "PHONE": cls.PHONE,
-            "SOURCE_CHANNELS": cls.SOURCE_CHATS,
-            "TARGET_CHANNEL": cls.TARGET_CHAT
+            "BOT_TOKEN": cls.BOT_TOKEN,
+            "TARGET_CHANNEL": cls.TARGET_CHANNEL,
+            "SOURCE_CHANNELS": cls.SOURCE_CHANNELS
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
-            logger.error(f"Missing config: {missing}")
+            logger.error(f"Missing configuration: {', '.join(missing)}")
             exit(1)
 
-TelegramConfig.validate()
+Config.validate()
 
 # Telegram client setup
-client = TelegramClient(
-    session="translation_bot_session",
-    api_id=TelegramConfig.API_ID,
-    api_hash=TelegramConfig.API_HASH
-)
+client = TelegramClient("railway_session", Config.API_ID, Config.API_HASH).start(bot_token=Config.BOT_TOKEN)
 
-async def limited_translate(text: str) -> str:
-    """Resource-constrained translation with fallback"""
+# Translation function with proper URL handling
+def translate_text(text: str) -> str:
     try:
-        # Preserve URLs during translation
-        urls = ResourceManager.URL_REGEX.findall(text)
-        text = ResourceManager.URL_REGEX.sub("URL_PLACEHOLDER", text)
+        url_placeholders = {}
+        for i, url in enumerate(re.findall(r'https?://\S+', text)):
+            placeholder = f"URL_{i}"
+            text = text.replace(url, placeholder)
+            url_placeholders[placeholder] = url
         
-        translated = await asyncio.wait_for(
-            asyncio.to_thread(
-                GoogleTranslator(source="auto", target="fa").translate,
-                text
-            ),
-            timeout=ResourceManager.TRANSLATION_TIMEOUT
-        )
+        translated = GoogleTranslator(source='auto', target='fa').translate(text)
         
-        for i, url in enumerate(urls):
-            translated = translated.replace(f"URL_PLACEHOLDER{i+1}", url)
-            
+        for placeholder, url in url_placeholders.items():
+            translated = translated.replace(placeholder, url)
+        
         return translated
     except Exception as e:
-        logger.warning(f"Translation fallback: {e}")
+        logger.error(f"Translation error: {e}")
         return text
 
-async def handle_media_with_caption(event):
-    """Optimized media handling with separated caption processing"""
+async def handle_media_message(event):
     try:
-        # Send media immediately
+        # Send media first
         media_msg = await client.send_file(
-            TelegramConfig.TARGET_CHAT,
+            Config.TARGET_CHANNEL,
             event.message.media
         )
         
-        # Process caption in background if exists
+        # Process caption separately
         if event.message.text:
-            asyncio.create_task(
-                process_caption(media_msg, event.message.text)
-            
+            translated = translate_text(event.message.text)
+            await client.send_message(
+                Config.TARGET_CHANNEL,
+                f"{translated}\n\n@whaleguardian",
+                reply_to=media_msg.id
+            )
     except Exception as e:
-        logger.error(f"Media error: {e}")
+        logger.error(f"Media handling error: {e}")
 
-async def process_caption(media_msg, caption: str):
-    """Background caption processing"""
-    try:
-        translated = await limited_translate(caption)
-        await client.send_message(
-            TelegramConfig.TARGET_CHAT,
-            f"{translated}\n\n@whaleguardian",
-            reply_to=media_msg.id
-        )
-    except Exception as e:
-        logger.error(f"Caption error: {e}")
-
-@client.on(events.NewMessage(chats=TelegramConfig.SOURCE_CHATS))
-async def efficient_handler(event):
-    """Resource-constrained message handler"""
+@client.on(events.NewMessage(chats=Config.SOURCE_CHANNELS))
+async def message_handler(event):
     try:
         if event.message.media:
-            await handle_media_with_caption(event)
+            await handle_media_message(event)
         elif event.message.text:
-            translated = await limited_translate(event.message.text)
+            translated = translate_text(event.message.text)
             await client.send_message(
-                TelegramConfig.TARGET_CHAT,
+                Config.TARGET_CHANNEL,
                 f"{translated}\n\n@whaleguardian"
             )
     except Exception as e:
         logger.error(f"Handler error: {e}")
 
-# Minimal keep-alive server
+# Flask keep-alive server
 app = Flask(__name__)
 
 @app.route("/")
-def ping():
-    return "OK"
+def health_check():
+    return "Bot is running"
 
-def run_server():
-    app.run(host="0.0.0.0", port=8080, threaded=True)
-
-async def main():
-    await client.start(phone=TelegramConfig.PHONE)
-    logger.warning("Bot started in low-resource mode")
-    await client.run_until_disconnected()
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 if __name__ == "__main__":
-    # Start lightweight server in background
-    Thread(target=run_server, daemon=True).start()
-    
-    # Configure event loop for resource constraints
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    try:
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        logger.warning("Graceful shutdown")
-    finally:
-        loop.close()
+    Thread(target=run_flask, daemon=True).start()
+    logger.info("Starting Telegram bot...")
+    client.run_until_disconnected()
