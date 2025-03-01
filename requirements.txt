@@ -1,0 +1,7 @@
+python-telegram-bot
+python-dotenv
+telegram
+telethon
+deep-translator
+nest_asyncio
+flask
